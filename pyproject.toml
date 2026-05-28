@@ -1,0 +1,26 @@
+[project]
+name = "repocast"
+version = "0.1.0"
+description = "Convert a GitHub repository into a Chinese podcast audio file"
+requires-python = ">=3.10"
+dependencies = [
+    "click>=8.1",
+    "rich>=13.0",
+    "google-genai>=1.0",
+    "azure-cognitiveservices-speech>=1.38",
+    "tenacity>=8.2",
+    "tiktoken>=0.7",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "ruff"]
+
+[project.scripts]
+repocast = "repocast.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["repocast*"]
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
