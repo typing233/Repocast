@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import re
+import xml.sax.saxutils as saxutils
 
 import azure.cognitiveservices.speech as speechsdk
 from tenacity import retry, stop_after_attempt, wait_exponential
@@ -10,40 +11,75 @@ from repocast.config import Config
 
 logger = logging.getLogger(__name__)
 
-MAX_SSML_CHARS = 4000  # conservative limit per synthesis call
+MAX_SEGMENT_CHARS = 4000
+
+
+def _escape_xml(text: str) -> str:
+    return saxutils.escape(text, {'"': "&quot;"})
+
+
+def _process_paragraph(paragraph: str) -> str:
+    """Process a single paragraph: escape XML, then wrap English terms in <lang> tags."""
+    # First escape all XML-special characters
+    escaped = _escape_xml(paragraph)
+
+    # Wrap standalone English terms (3+ chars, letters/digits/dot/underscore/hyphen)
+    # Use a regex that won't match inside XML entities (which start with &)
+    def wrap_english(m: re.Match) -> str:
+        term = m.group(0)
+        return f'<lang xml:lang="en-US">{term}</lang>'
+
+    # Match English words: start with letter, followed by letters/digits/dots/underscores/hyphens
+    # Negative lookbehind for & to avoid matching XML entity internals like "amp" in "&amp;"
+    processed = re.sub(
+        r"(?<!&)(?<![A-Za-z])[A-Za-z][A-Za-z0-9_.\-]{2,}(?![A-Za-z;])",
+        wrap_english,
+        escaped,
+    )
+    return processed
 
 
 def _text_to_ssml(text: str, voice_name: str) -> str:
-    """Convert a text segment to SSML with pauses and prosody."""
-    # Escape XML special characters
-    text = text.replace("&", "&amp;")
-    text = text.replace("<", "&lt;")
-    text = text.replace(">", "&gt;")
-    text = text.replace('"', "&quot;")
+    """Convert a text segment to valid SSML with pauses and prosody."""
+    # Split into paragraphs for structured processing
+    lines = text.split("\n")
+    ssml_body_parts: list[str] = []
+    pending_break = False
 
-    # Add pauses for section headers like 【开场】
-    text = re.sub(
-        r"【([^】]+)】",
-        r'<break time="1000ms"/>【\1】<break time="600ms"/>',
-        text,
-    )
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            pending_break = True
+            continue
 
-    # Add pauses for paragraph breaks
-    text = re.sub(r"\n\n+", '\n<break time="600ms"/>\n', text)
+        # Check if this is a section header like 【开场】
+        header_match = re.match(r"^【([^】]+)】(.*)$", stripped)
 
-    # Wrap English terms for better pronunciation
-    text = re.sub(
-        r"\b([A-Za-z][A-Za-z0-9_.]{2,})\b",
-        r'<lang xml:lang="en-US">\1</lang>',
-        text,
-    )
+        if pending_break and ssml_body_parts:
+            ssml_body_parts.append('<break time="600ms"/>')
+            pending_break = False
+
+        if header_match:
+            header_title = header_match.group(1)
+            rest = header_match.group(2).strip()
+            ssml_body_parts.append('<break time="1000ms"/>')
+            ssml_body_parts.append(_process_paragraph(f"【{header_title}】"))
+            ssml_body_parts.append('<break time="600ms"/>')
+            if rest:
+                ssml_body_parts.append(_process_paragraph(rest))
+        else:
+            ssml_body_parts.append(_process_paragraph(stripped))
+
+    body = "\n".join(ssml_body_parts)
 
     ssml = (
-        '<speak version="1.0" xmlns="http://www.w3.org/2001/Math/MathML" '
-        'xmlns:mstts="https://www.w3.org/2001/mstts" xml:lang="zh-CN">'
+        '<speak version="1.0" '
+        'xmlns="http://www.w3.org/2001/10/synthesis" '
+        'xmlns:mstts="http://www.w3.org/2001/mstts" '
+        'xml:lang="zh-CN">'
         f'<voice name="{voice_name}">'
         '<prosody rate="-5%">'
-        f"{text}"
+        f"{body}"
         "</prosody>"
         "</voice>"
         "</speak>"
@@ -51,7 +87,7 @@ def _text_to_ssml(text: str, voice_name: str) -> str:
     return ssml
 
 
-def _split_into_segments(script: str, max_chars: int = MAX_SSML_CHARS) -> list[str]:
+def _split_into_segments(script: str, max_chars: int = MAX_SEGMENT_CHARS) -> list[str]:
     """Split script into segments at paragraph boundaries."""
     paragraphs = re.split(r"\n\n+", script)
     segments: list[str] = []
@@ -62,9 +98,8 @@ def _split_into_segments(script: str, max_chars: int = MAX_SSML_CHARS) -> list[s
         if not para:
             continue
 
-        if len(current) + len(para) + 2 > max_chars:
-            if current:
-                segments.append(current)
+        if len(current) + len(para) + 2 > max_chars and current:
+            segments.append(current)
             current = para
         else:
             current = f"{current}\n\n{para}" if current else para
@@ -78,6 +113,10 @@ def _split_into_segments(script: str, max_chars: int = MAX_SSML_CHARS) -> list[s
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=2, min=5, max=30),
+    before_sleep=lambda retry_state: logging.getLogger(__name__).warning(
+        f"片段合成失败，{retry_state.next_action.sleep:.0f}s后重试 "
+        f"(第{retry_state.attempt_number}次): {retry_state.outcome.exception()}"
+    ),
 )
 def _synthesize_segment(
     synthesizer: speechsdk.SpeechSynthesizer, ssml: str
@@ -124,18 +163,9 @@ def synthesize_to_mp3(
     for i, segment in enumerate(segments):
         logger.info(f"合成片段 {i+1}/{len(segments)} ...")
         ssml = _text_to_ssml(segment, config.azure_voice_name)
+        audio_data = _synthesize_segment(synthesizer, ssml)
+        audio_parts.append(audio_data)
 
-        try:
-            audio_data = _synthesize_segment(synthesizer, ssml)
-            audio_parts.append(audio_data)
-        except RuntimeError as e:
-            logger.warning(f"片段 {i+1} 合成失败，跳过: {e}")
-            continue
-
-    if not audio_parts:
-        raise RuntimeError("所有音频片段合成均失败")
-
-    # Concatenate MP3 segments (same bitrate = safe concatenation)
     with open(output_path, "wb") as f:
         for part in audio_parts:
             f.write(part)
